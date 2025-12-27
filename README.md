@@ -1,36 +1,41 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Groq STT PoC
 
-## Getting Started
+iPhone（WebKit）向けに最適化された「録音→テキスト変換」Webアプリです。Groqの高速Whisperモデルを使用しています。
 
-First, run the development server:
+## セットアップ
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+1.  **依存関係のインストール**:
+    ```bash
+    npm install
+    ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+2.  **環境変数の設定**:
+    `.env.example` を `.env` にコピーし、Groq APIキーを設定してください。
+    ```env
+    GROQ_API_KEY=gsk_...
+    ```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+3.  **開発サーバーの起動**:
+    ```bash
+    npm run dev
+    ```
+    [http://localhost:3000](http://localhost:3000) を開いてください（モバイルテストにはローカルIPを使用）。
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## アーキテクチャ
 
-## Learn More
+- **フロントエンド**: Next.js App Router, Tailwind CSS, ShadCN/UI
+- **バックエンド**: Next.js Route Handler (`/api/transcribe`)
+- **音声認識**: Groq API (whisper-large-v3-turbo)
 
-To learn more about Next.js, take a look at the following resources:
+## 注意事項
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- **クライアント側制限**: 送信中はボタンを無効化し、連打を防止（最低2秒間）
+- **サーバー側制限**: インメモリロックで同時リクエストを1つに制限
+- **レート制限対応**: 429エラー時は `Retry-After` ヘッダーを読み取り、待ち時間を表示
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## 今後の改善案
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- [ ] getUserMedia/MediaRecorderによるリアルタイム録音
+- [ ] WebSocket対応でストリーミング文字起こし
+- [ ] 多言語対応（日本語音声→日本語テキスト）
+- [ ] Redis/KVによる分散環境対応のレート制限
