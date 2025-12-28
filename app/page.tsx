@@ -2,12 +2,12 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
-import { Textarea } from '@/components/ui/textarea';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Mic, Square, Loader2, AlertCircle } from 'lucide-react';
+import { Mic, Square, Loader2, AlertCircle, BookOpen, Clock } from 'lucide-react';
 
 type Status = 'idle' | 'recording' | 'error' | 'rate-limited';
+type AnnotationStatus = 'idle' | 'loading' | 'done' | 'error' | 'rate-limited';
 
 interface TranscribeResponse {
   text?: string;
@@ -16,8 +16,21 @@ interface TranscribeResponse {
   details?: unknown;
 }
 
-// チャンク送信間隔（ミリ秒）- 4秒に設定
-const CHUNK_INTERVAL_MS = 4000;
+interface Annotation {
+  surface: string;
+  katakana: string;
+  gloss?: string;
+}
+
+interface AnnotateResponse {
+  annotations: Annotation[];
+  wait_seconds?: number;
+  error?: string;
+}
+
+// チャンク送信間隔オプション（秒）
+const CHUNK_INTERVAL_OPTIONS = [2, 3, 4, 5, 6];
+const DEFAULT_CHUNK_INTERVAL = 4;
 
 export default function Home() {
   const [status, setStatus] = useState<Status>('idle');
@@ -27,13 +40,24 @@ export default function Home() {
   const [recordingTime, setRecordingTime] = useState<number>(0);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
 
+  // アノテーション関連
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [annotationStatus, setAnnotationStatus] = useState<AnnotationStatus>('idle');
+  const [annotationEnabled, setAnnotationEnabled] = useState<boolean>(true);
+  const [annotationCountdown, setAnnotationCountdown] = useState<number>(0);
+
+  // チャンク間隔（秒）
+  const [chunkInterval, setChunkInterval] = useState<number>(DEFAULT_CHUNK_INTERVAL);
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const chunkIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const annotationCountdownRef = useRef<NodeJS.Timeout | null>(null);
   const mimeTypeRef = useRef<string>('');
   const isRecordingRef = useRef<boolean>(false);
+  const pendingAnnotationRef = useRef<string>('');
 
   // カウントダウン処理
   useEffect(() => {
@@ -58,6 +82,29 @@ export default function Home() {
     };
   }, [countdown]);
 
+  // アノテーションカウントダウン
+  useEffect(() => {
+    if (annotationCountdown > 0) {
+      annotationCountdownRef.current = setInterval(() => {
+        setAnnotationCountdown((prev) => {
+          if (prev <= 1) {
+            if (annotationCountdownRef.current) {
+              clearInterval(annotationCountdownRef.current);
+            }
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+
+    return () => {
+      if (annotationCountdownRef.current) {
+        clearInterval(annotationCountdownRef.current);
+      }
+    };
+  }, [annotationCountdown]);
+
   // クリーンアップ
   useEffect(() => {
     return () => {
@@ -79,9 +126,47 @@ export default function Home() {
     }
   };
 
+  // アノテーションを取得
+  const fetchAnnotations = useCallback(async (text: string) => {
+    if (!annotationEnabled || !text.trim()) return;
+
+    setAnnotationStatus('loading');
+
+    try {
+      const response = await fetch('/api/annotate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+
+      const data: AnnotateResponse = await response.json();
+
+      if (response.status === 429) {
+        setAnnotationStatus('rate-limited');
+        const waitTime = data.wait_seconds || 5;
+        setAnnotationCountdown(waitTime);
+        pendingAnnotationRef.current = text;
+      } else if (response.ok && data.annotations) {
+        setAnnotations(prev => {
+          // 重複を避けて追加
+          const existingSurfaces = new Set(prev.map(a => a.surface.toLowerCase()));
+          const newAnnotations = data.annotations.filter(
+            a => !existingSurfaces.has(a.surface.toLowerCase())
+          );
+          return [...prev, ...newAnnotations];
+        });
+        setAnnotationStatus('done');
+      } else {
+        setAnnotationStatus('error');
+      }
+    } catch (err) {
+      console.error('Annotation error:', err);
+      setAnnotationStatus('error');
+    }
+  }, [annotationEnabled]);
+
   // 音声をAPIに送信
   const sendAudioForTranscription = useCallback(async (audioBlob: Blob) => {
-    // 小さすぎるチャンクはスキップ（5KB未満）
     if (audioBlob.size < 5000) {
       console.log(`Skipping small chunk: ${audioBlob.size} bytes`);
       return;
@@ -106,20 +191,21 @@ export default function Home() {
       const data: TranscribeResponse = await response.json();
 
       if (response.ok && data.text) {
-        setTranscription(prev => {
-          const newText = data.text?.trim();
-          if (!newText) return prev;
-          return prev ? `${prev} ${newText}` : newText;
-        });
+        const newText = data.text.trim();
+        if (newText) {
+          setTranscription(prev => {
+            const updated = prev ? `${prev} ${newText}` : newText;
+            // アノテーションを非同期で取得
+            setTimeout(() => fetchAnnotations(updated), 100);
+            return updated;
+          });
+        }
         setError('');
       } else if (response.status === 429) {
         const waitTime = data.retryAfter || 5;
         setCountdown(waitTime);
         setError(`レート制限: ${waitTime}秒後に再開します`);
       } else {
-        const errorDetail = data.details ? JSON.stringify(data.details) : '';
-        console.error('API Error:', response.status, data.error, errorDetail);
-        // 400エラーは無音の可能性があるので表示しない
         if (response.status !== 400) {
           setError(`${data.error || 'API Error'} (${response.status})`);
         }
@@ -130,7 +216,7 @@ export default function Home() {
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [fetchAnnotations]);
 
   // MediaRecorderを開始する関数
   const startMediaRecorder = useCallback((stream: MediaStream, onComplete: (blob: Blob) => void) => {
@@ -160,6 +246,7 @@ export default function Home() {
     try {
       setError('');
       setTranscription('');
+      setAnnotations([]);
       setRecordingTime(0);
       isRecordingRef.current = true;
 
@@ -171,7 +258,6 @@ export default function Home() {
       });
       streamRef.current = stream;
 
-      // 対応フォーマットを検出
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : MediaRecorder.isTypeSupported('audio/mp4')
@@ -181,27 +267,22 @@ export default function Home() {
       mimeTypeRef.current = mimeType;
       console.log('Using MIME type:', mimeType);
 
-      // 最初のMediaRecorderを開始
       mediaRecorderRef.current = startMediaRecorder(stream, sendAudioForTranscription);
       setStatus('recording');
 
-      // 録音時間カウンター
       recordingTimerRef.current = setInterval(() => {
         setRecordingTime(prev => prev + 1);
       }, 1000);
 
-      // 定期的にMediaRecorderを再起動して完全な音声ファイルを作成
       chunkIntervalRef.current = setInterval(() => {
         if (!isRecordingRef.current || !streamRef.current) return;
 
-        // 現在のMediaRecorderを停止（これでonstopが呼ばれてBlobが送信される）
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
           mediaRecorderRef.current.stop();
         }
 
-        // 新しいMediaRecorderを開始
         mediaRecorderRef.current = startMediaRecorder(streamRef.current, sendAudioForTranscription);
-      }, CHUNK_INTERVAL_MS);
+      }, chunkInterval * 1000);
 
     } catch (err) {
       console.error('Recording error:', err);
@@ -213,19 +294,17 @@ export default function Home() {
         setError('マイクの初期化に失敗しました');
       }
     }
-  }, [startMediaRecorder, sendAudioForTranscription]);
+  }, [startMediaRecorder, sendAudioForTranscription, chunkInterval]);
 
   // 録音停止
   const stopRecording = useCallback(() => {
     isRecordingRef.current = false;
     stopAllTimers();
 
-    // 最後のチャンクを送信
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
     }
 
-    // ストリームを停止
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
     }
@@ -233,7 +312,6 @@ export default function Home() {
     setStatus('idle');
   }, []);
 
-  // ボタンクリック処理
   const handleButtonClick = () => {
     if (status === 'recording') {
       stopRecording();
@@ -242,16 +320,58 @@ export default function Home() {
     }
   };
 
-  // クリアボタン
   const handleClear = () => {
     setTranscription('');
+    setAnnotations([]);
+    setAnnotationStatus('idle');
   };
 
-  // フォーマット：秒を MM:SS に
+  const handleRetryAnnotation = () => {
+    if (pendingAnnotationRef.current) {
+      fetchAnnotations(pendingAnnotationRef.current);
+    } else if (transcription) {
+      fetchAnnotations(transcription);
+    }
+  };
+
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // テキストをルビ付きでレンダリング
+  const renderTextWithRuby = () => {
+    if (!transcription) return null;
+    if (!annotationEnabled || annotations.length === 0) {
+      return <span>{transcription}</span>;
+    }
+
+    // アノテーションをマップに変換（小文字キー）
+    const annotationMap = new Map<string, Annotation>();
+    for (const ann of annotations) {
+      annotationMap.set(ann.surface.toLowerCase(), ann);
+    }
+
+    // トークン分割（単語と区切り文字を保持）
+    const tokens = transcription.split(/(\s+|[.,!?;:'"()-])/);
+
+    return (
+      <>
+        {tokens.map((token, index) => {
+          const ann = annotationMap.get(token.toLowerCase());
+          if (ann && ann.gloss) {
+            return (
+              <ruby key={index} title={`${ann.katakana}`} className="ruby-annotation">
+                {token}
+                <rt>{ann.gloss}</rt>
+              </ruby>
+            );
+          }
+          return <span key={index}>{token}</span>;
+        })}
+      </>
+    );
   };
 
   return (
@@ -308,8 +428,29 @@ export default function Home() {
           {status === 'recording' && (
             <div className="flex justify-center items-center gap-2 text-green-400">
               <span className="w-3 h-3 bg-green-400 rounded-full animate-pulse"></span>
-              <span>Live transcription every {CHUNK_INTERVAL_MS / 1000}s</span>
+              <span>Live transcription every {chunkInterval}s</span>
               {isProcessing && <Loader2 className="w-4 h-4 animate-spin ml-2" />}
+            </div>
+          )}
+
+          {/* チャンク間隔セレクター（録音中は非表示）*/}
+          {status !== 'recording' && (
+            <div className="flex items-center justify-between px-2">
+              <div className="flex items-center gap-2 text-slate-300">
+                <Clock className="w-4 h-4" />
+                <span className="text-sm">文字起こし間隔</span>
+              </div>
+              <select
+                value={chunkInterval}
+                onChange={(e) => setChunkInterval(Number(e.target.value))}
+                className="bg-slate-700 border border-slate-600 text-white rounded px-3 py-1 text-sm"
+              >
+                {CHUNK_INTERVAL_OPTIONS.map((sec) => (
+                  <option key={sec} value={sec}>
+                    {sec}秒
+                  </option>
+                ))}
+              </select>
             </div>
           )}
 
@@ -320,6 +461,51 @@ export default function Home() {
               <AlertTitle>エラー</AlertTitle>
               <AlertDescription>{error}</AlertDescription>
             </Alert>
+          )}
+
+          {/* ルビ機能トグル */}
+          <div className="flex items-center justify-between px-2">
+            <div className="flex items-center gap-2 text-slate-300">
+              <BookOpen className="w-4 h-4" />
+              <span className="text-sm">難しい単語にルビ表示</span>
+            </div>
+            <button
+              onClick={() => setAnnotationEnabled(!annotationEnabled)}
+              className={`w-12 h-6 rounded-full transition-colors ${annotationEnabled ? 'bg-purple-500' : 'bg-slate-600'
+                }`}
+            >
+              <div
+                className={`w-5 h-5 bg-white rounded-full transition-transform ${annotationEnabled ? 'translate-x-6' : 'translate-x-0.5'
+                  }`}
+              />
+            </button>
+          </div>
+
+          {/* アノテーションステータス */}
+          {annotationEnabled && (
+            <div className="flex items-center justify-center gap-2 text-sm">
+              {annotationStatus === 'loading' && (
+                <span className="text-yellow-400 flex items-center gap-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Annotating...
+                </span>
+              )}
+              {annotationStatus === 'done' && annotations.length > 0 && (
+                <span className="text-green-400">
+                  ✓ {annotations.length} words annotated
+                </span>
+              )}
+              {annotationStatus === 'rate-limited' && (
+                <span className="text-orange-400 flex items-center gap-2">
+                  Rate limited: wait {annotationCountdown}s
+                  {annotationCountdown === 0 && (
+                    <Button size="sm" variant="outline" onClick={handleRetryAnnotation}>
+                      Retry
+                    </Button>
+                  )}
+                </span>
+              )}
+            </div>
           )}
 
           {/* 結果表示 */}
@@ -339,21 +525,39 @@ export default function Home() {
                 </Button>
               )}
             </div>
-            <Textarea
-              value={transcription}
-              placeholder="Start recording to see transcription..."
-              readOnly
-              className="min-h-[200px] bg-slate-900/50 border-slate-600 text-white text-lg leading-relaxed resize-none"
-            />
+            <div className="min-h-[200px] p-4 bg-slate-900/50 border border-slate-600 rounded-md text-white text-lg leading-relaxed">
+              {transcription ? (
+                renderTextWithRuby()
+              ) : (
+                <span className="text-slate-500">Start recording to see transcription...</span>
+              )}
+            </div>
           </div>
 
           {/* 使い方 */}
           <div className="text-center text-slate-500 text-xs space-y-1">
-            <p>💡 録音中は{CHUNK_INTERVAL_MS / 1000}秒ごとに自動で文字起こし</p>
+            <p>💡 録音中は選択した間隔で自動で文字起こし</p>
             <p>🎤 マイクへのアクセス許可が必要です</p>
           </div>
         </CardContent>
       </Card>
+
+      {/* Ruby用CSS */}
+      <style jsx global>{`
+        .ruby-annotation {
+          position: relative;
+          cursor: help;
+        }
+        .ruby-annotation rt {
+          font-size: 0.6em;
+          color: #a78bfa;
+          font-weight: normal;
+        }
+        .ruby-annotation:hover {
+          background-color: rgba(167, 139, 250, 0.2);
+          border-radius: 2px;
+        }
+      `}</style>
     </main>
   );
 }
